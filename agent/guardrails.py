@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -80,6 +81,13 @@ def check_grounding(
     check the specific one you're grading against before disabling this)."""
     cited = tuple(answer.get("cited_anchors") or ())
     retrieved = frozenset(retrieved_anchors)
+    parsed_retrieved = []
+    if _ANCHOR_AVAILABLE:
+        for raw in retrieved:
+            try:
+                parsed_retrieved.append(Anchor.parse(raw))
+            except (AnchorSyntaxError, TypeError):
+                continue
 
     malformed: list[str] = []
     ungrounded: list[str] = []
@@ -89,11 +97,15 @@ def check_grounding(
             continue
         if _ANCHOR_AVAILABLE:
             try:
-                Anchor.parse(a)
+                parsed = Anchor.parse(a)
             except AnchorSyntaxError:
                 malformed.append(a)
                 continue
-        if a not in retrieved:
+        matched = a in retrieved
+        if not matched and _ANCHOR_AVAILABLE:
+            matched = any((parsed.ns, parsed.slug, parsed.idx) == (source.ns, source.slug, source.idx)
+                          and (parsed.rev is None or parsed.rev == source.rev) for source in parsed_retrieved)
+        if not matched:
             ungrounded.append(a)
 
     grounded = not malformed and not ungrounded and (bool(cited) or not require_citation)
@@ -106,7 +118,7 @@ def check_grounding(
 
 
 # ---------------------------------------------------------------------------
-# 2. INJECTED-INSTRUCTION REFUSAL — STUB.
+# 2. INJECTED-INSTRUCTION REFUSAL.
 # ---------------------------------------------------------------------------
 
 
@@ -131,7 +143,7 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
 
 
 # ---------------------------------------------------------------------------
-# 3. REDACTION — STUB.
+# 3. REDACTION.
 # ---------------------------------------------------------------------------
 
 
@@ -142,10 +154,10 @@ class RedactionResult:
 
 
 def redact(text: str, private_values: Iterable[str] = ()) -> RedactionResult:
-    """Redact supplied private source values (normalized whitespace, at least 40 characters), email addresses, credentials and explicit private notes. Source privacy metadata must supply private_values for arbitrary private prose."""
+    """Redact supplied private values, emails, credentials and explicit private notes. Private values must come from source privacy metadata."""
     hits = []
     for value in private_values:
-        if not isinstance(value, str) or len(' '.join(value.split())) < 40:
+        if not isinstance(value, str) or not value.strip():
             continue
         pattern = r'\s+'.join(re.escape(part) for part in value.split())
         text, count = re.subn(pattern, '[REDACTED]', text, flags=re.I)
@@ -163,7 +175,7 @@ def redact(text: str, private_values: Iterable[str] = ()) -> RedactionResult:
 
 
 # ---------------------------------------------------------------------------
-# 4. ARITHMETIC VERIFICATION — STUB.
+# 4. ARITHMETIC VERIFICATION.
 # ---------------------------------------------------------------------------
 
 
@@ -179,8 +191,9 @@ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 def verify_arithmetic(text: str, sources: Iterable[str] = ()) -> ArithmeticCheckResult:
     """Verify explicit arithmetic with Decimal. With supplied source text, check numerical spelling and precision. No-source factual numbers remain unchecked, never silently certified."""
-    from decimal import Decimal
-    equations = re.findall(r'(-?\d+(?:\.\d+)?)\s*([+*/×÷-])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)', text)
+    text = re.sub(r'\b(?:Frame|Concept|Deck|Note|Learner|Source|Claim|Talk|KC):[^\s,;]+', '', text)
+    equation_pattern = r'(-?\d+(?:\.\d+)?)\s*([+*/×÷-])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)'
+    equations = re.findall(equation_pattern, text)
     for a, op, b, stated in equations:
         left, right, expected = Decimal(a), Decimal(b), Decimal(stated)
         if op in ('/', '÷') and right == 0:
@@ -191,20 +204,22 @@ def verify_arithmetic(text: str, sources: Iterable[str] = ()) -> ArithmeticCheck
         if actual != expected:
             return ArithmeticCheckResult(True, False, 'Arithmetic equation is incorrect')
     source_text = ' '.join(str(value) for value in sources)
-    numbers = _NUMBER_RE.findall(text)
-    if source_text and numbers and not equations:
+    numbers = _NUMBER_RE.findall(re.sub(equation_pattern, '', text))
+    if source_text and numbers:
         supported = set(_NUMBER_RE.findall(source_text))
         if any(number not in supported for number in numbers):
             return ArithmeticCheckResult(True, False, 'Number or precision is absent from retrieved sources')
         return ArithmeticCheckResult(True, True, 'Numbers match retrieved source precision')
-    if equations:
-        return ArithmeticCheckResult(True, True, 'Explicit equations verified; other factual numbers need sources')
+    if equations and not numbers:
+        return ArithmeticCheckResult(True, True, 'Explicit equations verified')
+    if numbers:
+        return ArithmeticCheckResult(False, None, 'Factual numbers require retrieved sources, even when an equation is correct')
     return ArithmeticCheckResult(False, None, 'No equation or retrieved numerical evidence to verify')
 
 
 
 # ---------------------------------------------------------------------------
-# 5. ABSTENTION POLICY — real, naive.
+# 5. ABSTENTION POLICY.
 # ---------------------------------------------------------------------------
 
 

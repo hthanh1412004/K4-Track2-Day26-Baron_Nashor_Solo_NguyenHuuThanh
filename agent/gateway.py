@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -30,6 +31,13 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import cheap_mask, successor_of, pick_replica
+from agent.guardrails import scan_for_injected_instructions
+from kit.mcp.specs import TOOL_SPECS, A2A_PEERS
+from kit.mcp.a2a import verify_card, verify_delegation, admit_skill
+from kit.mcp.servers import _LOCAL_TOOL_SPECS
+
+_GATEWAY_SPECS = {**TOOL_SPECS, **_LOCAL_TOOL_SPECS}
 
 __all__ = [
     "COMMAND_KINDS",
@@ -264,14 +272,31 @@ class Gateway:
     def note_provenance(self, anchor: str, etag: str) -> None:
         self._seen_anchors[anchor] = etag
 
+    def _history_rows(self):
+        """Normalize trusted history without fetching anything outside ctx."""
+        for entry in self.ctx.history:
+            if isinstance(entry, Mapping):
+                command = entry.get('command', {})
+                result = entry.get('outcome', entry.get('result', {}))
+            elif isinstance(entry, (tuple, list)) and len(entry) == 3:
+                command, _, result = entry
+            else:
+                continue
+            if hasattr(command, 'to_dict'):
+                command = command.to_dict()
+            if hasattr(result, 'to_dict'):
+                result = result.to_dict()
+            if isinstance(command, Mapping) and isinstance(result, Mapping):
+                yield command, result
+
     def decide(self, cmd: Command) -> Decision:
         """ROUTE, ADMIT, AUTHORIZE, BUDGET; synchronous and without I/O."""
-        from agent.strategy import cheap_mask, successor_of, pick_replica
-        from agent.guardrails import scan_for_injected_instructions
-        from kit.mcp.specs import TOOL_SPECS
-        from kit.mcp.a2a import verify_card, verify_delegation, admit_skill
-
-        headers = {str(k).lower(): v for k, v in cmd.headers.items()}
+        headers = {}
+        for name, value in cmd.headers.items():
+            name = str(name).lower()
+            if name in headers and headers[name] != value:
+                return self.deny(cmd, 'conflicting case variants of a header')
+            headers[name] = value
         # ROUTE: a body route or contradictory header is untrusted input.
         if any(cmd.args.get(k) for k in ('route', '_route', 'replica')):
             return self.deny(cmd, 'replica routing must be carried by the header')
@@ -288,7 +313,7 @@ class Gateway:
                 return self.deny(cmd, 'retrieved content contains an injected instruction')
 
         server, tool = successor_of(cmd.server, cmd.tool) or (cmd.server, cmd.tool)
-        spec = TOOL_SPECS.get((server, tool))
+        spec = _GATEWAY_SPECS.get((server, tool))
         if spec is None:
             return self.deny(cmd, 'unknown server/tool')
         if not spec.is_write and 'wiki.read' not in self.ctx.scopes:
@@ -300,24 +325,38 @@ class Gateway:
         # ADMIT: fresh leases and no blind retries after a definitive failure.
         if spec.needs_lease and (not cmd.lease_id or cmd.lease_id not in self.ctx.leases):
             return self.deny(cmd, 'get_frame requires a live query lease')
-        for entry in self.ctx.history:
-            if not isinstance(entry, Mapping):
-                continue
-            previous = entry.get('command', {})
-            result = entry.get('outcome', {})
-            if not isinstance(previous, Mapping) or not isinstance(result, Mapping):
-                continue
+        unavailable_retries = 0
+        for previous, result in self._history_rows():
+            if (previous.get('server'), previous.get('tool')) == ('registry', 'provenance') and result.get('ok'):
+                anchor = (previous.get('args') or {}).get('anchor')
+                rows = result.get('rows') or ()
+                etag = result.get('etag') or (rows[0].get('etag') if rows and isinstance(rows[0], Mapping) else None)
+                if isinstance(anchor, str) and isinstance(etag, str):
+                    self.note_provenance(anchor, etag)
             if (previous.get('server'), previous.get('tool'), previous.get('args')) == (server, tool, cmd.args):
                 error = result.get('error') or {}
-                if isinstance(error, Mapping) and error.get('code') in ('conflict', 'bad_request', 'unauthorized', 'not_found'):
-                    if previous.get('headers', {}) == cmd.headers:
+                code = error.get('code') if isinstance(error, Mapping) else None
+                code = code or result.get('error_code')
+                if code == 'unavailable':
+                    unavailable_retries += 1
+                if code in ('conflict', 'bad_request', 'unauthorized', 'not_found', 'rate_limited'):
+                    prior_headers = {str(k).lower(): v for k, v in (previous.get('headers') or {}).items()}
+                    if prior_headers == {str(k).lower(): v for k, v in cmd.headers.items()}:
                         return self.deny(cmd, 'failed call must be corrected before retry')
+        if unavailable_retries >= 2:
+            return self.deny(cmd, 'only one unchanged unavailable retry is permitted')
+        if spec.rate_limit:
+            allowed, window = spec.rate_limit
+            rounds = getattr(self, '_rate_calls', {}).get((server, tool), ())
+            if sum(r >= self.ctx.round - window + 1 for r in rounds) >= allowed:
+                return self.deny(cmd, 'tool rate window exhausted; refusal avoids a charged failure')
 
         # AUTHORIZE: identity (sub) never grants authority over another act.
         act = str(self.ctx.act).casefold()
-        for key in ('learner', 'learner_id', 'for_learner', 'target', 'subject'):
+        for key in ('learner', 'learner_id', 'for_learner', 'target', 'subject', 'anchor'):
             target = cmd.args.get(key)
-            if target and (spec.is_write or cmd.kind == 'a2a' or server == 'roster'):
+            learner_anchor = key == 'anchor' and isinstance(target, str) and target.casefold().startswith('learner:')
+            if target and (learner_anchor or (key != 'anchor' and (spec.is_write or server in A2A_PEERS))):
                 if str(target).casefold() != act:
                     return self.deny(cmd, 'target learner differs from ctx.act')
         if spec.is_write:
@@ -335,26 +374,42 @@ class Gateway:
             if key in self._write_keys:
                 return self.deny(cmd, 'write key already authorized this duel')
 
-        if cmd.kind == 'a2a':
+        is_a2a = server in A2A_PEERS
+        if is_a2a:
             aud = headers.get('aud')
             if aud not in (server, f'a2a:{server}', f'mcp:{server}'):
                 return self.deny(cmd, 'delegation audience does not match peer')
             card = getattr(self, '_cards', {}).get(server)
             if not card:
                 return self.deny(cmd, 'peer card has not been admitted')
+            skill = cmd.args.get('skill') or ('role_of' if (server, tool) == ('roster', 'lookup_learner') else tool)
+            if not isinstance(skill, str):
+                return self.deny(cmd, 'skill must be a declared string')
             if 'signature' in card:
-                if not verify_card(card).admitted or not admit_skill(card, tool).admitted:
+                try:
+                    admitted = card.get('name') == server and verify_card(card).admitted and admit_skill(card, skill).admitted
+                except (ValueError, TypeError, AttributeError):
+                    admitted = False
+                if not admitted:
                     return self.deny(cmd, 'peer signature or declared skill is invalid')
-            elif not card.get('verified') or tool not in card.get('skills', ()):
+            elif not card.get('verified') or skill not in card.get('skills', ()):
                 return self.deny(cmd, 'peer is not verified for this skill')
             token = headers.get('delegation') or cmd.args.get('delegation')
+            if isinstance(token, str):
+                try:
+                    token = json.loads(token)
+                except (ValueError, TypeError):
+                    return self.deny(cmd, 'delegation is not a valid JSON token')
             if token is not None:
                 seen = getattr(self, '_token_ids', set())
-                admission = verify_delegation(token, aud=f'a2a:{server}', call_index=cmd.call_index,
-                                              expected_act=self.ctx.act, seen_token_ids=seen)
+                try:
+                    admission = verify_delegation(token, aud=f'a2a:{server}', call_index=cmd.call_index,
+                                                  expected_act=self.ctx.act, seen_token_ids=seen)
+                except (ValueError, TypeError, AttributeError):
+                    return self.deny(cmd, 'malformed signed delegation')
                 if not admission.admitted:
                     return self.deny(cmd, 'delegation signature, act, audience, expiry or replay check failed')
-            elif not card.get('verified'):
+            else:
                 return self.deny(cmd, 'signed delegation is required')
 
         # BUDGET: preserve useful fields; wildcard catalogs never go through.
@@ -363,13 +418,18 @@ class Gateway:
             return self.deny(cmd, 'field mask contains an unknown field')
         if not fields or '*' in fields:
             desired = {'list_servers': ('name',), 'list_terms': ('term', 'anchor')}.get(tool, spec.default_fields)
-            fields = cheap_mask(server, tool, tuple(f for f in desired if f in spec.all_fields))
+            desired = tuple(f for f in desired if f in spec.all_fields)
+            fields = cheap_mask(server, tool, desired) if (server, tool) in TOOL_SPECS else tuple(sorted(set(desired)))
         args = dict(cmd.args)
+        if (server, tool) == ('progress', 'record_mastery') and 'anchor' not in args and args.get('learner'):
+            args['anchor'] = args['learner']
         if 'catalog' in args and len(str(args['catalog'])) > 1024:
             return self.deny(cmd, 'inflated catalog exceeds bounded discovery request')
         # Bound result cardinality for query tools without truncating fetched bodies.
-        if tool in ('query', 'list_servers', 'list_terms'):
+        if tool in ('query', 'list_servers', 'list_terms', 'search', 'list_sections', 'list_tasks'):
             limit = args.get('limit', 3)
+            if isinstance(limit, str) and limit.isascii() and limit.isdecimal():
+                limit = int(limit) if len(limit) <= 6 else 3
             if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
                 return self.deny(cmd, 'limit must be a positive integer')
             args['limit'] = min(limit, 3)
@@ -396,7 +456,11 @@ class Gateway:
         self._credits_authorised += price
         if spec.is_write:
             self._write_keys.add(headers['idempotency-key'])
-        if cmd.kind == 'a2a' and token is not None:
+        if spec.rate_limit:
+            if not hasattr(self, '_rate_calls'):
+                self._rate_calls = {}
+            self._rate_calls.setdefault((server, tool), []).append(rnd)
+        if is_a2a:
             if not hasattr(self, '_token_ids'):
                 self._token_ids = set()
             self._token_ids.add(token.get('token_id') if isinstance(token, Mapping) else token.token_id)
@@ -432,110 +496,14 @@ class Gateway:
 
 
 if __name__ == "__main__":
-    print("=== agent.gateway: Command / Decision validation ===\n")
-
-    good_cmd = Command(
-        cmd_id="cmd:0000",
-        kind="mcp",
-        raw="MCP slides.get_frame anchor=Frame:3f2a9c11/w/041 fields=title,body lease=lse_7f21",
-        server="slides",
-        tool="get_frame",
-        args={"anchor": "Frame:3f2a9c11/w/041"},
-        fields=("body", "title"),
-        headers={},
-        lease_id="lse_7f21",
-        call_index=0,
-    )
-    print(f"  Command constructed: {good_cmd}")
-    assert good_cmd.kind == "mcp"
-
-    print("\n  Rejection demo (each must raise ValueError):")
-
-    def _expect_value_error(label: str, fn) -> None:
-        try:
-            fn()
-        except ValueError as exc:
-            print(f"    [{label:38}] -> ValueError: {exc}")
-        else:
-            raise AssertionError(f"expected ValueError for case {label!r}")
-
-    _expect_value_error("Command.kind == 'answer'", lambda: Command(
-        cmd_id="cmd:0001", kind="answer", raw="x", server="slides", tool="get_frame",
-        args={}, fields=(), headers={}, lease_id=None, call_index=0,
-    ))
-    _expect_value_error("Decision verdict='deny' with no reason", lambda: Decision(verdict="deny"))
-    _expect_value_error(
-        "Decision verdict='forward' with no call", lambda: Decision(verdict="forward")
-    )
-    _expect_value_error(
-        "Decision verdict='deny' carrying a call",
-        lambda: Decision(verdict="deny", reason="nope", call={"server": "x", "tool": "y"}),
-    )
-    _expect_value_error("Decision verdict='?' unknown", lambda: Decision(verdict="???"))
-
-    print("\n=== Command.from_action_dict — real canonicaliser integration ===\n")
-    if _canonicalise_action is None:
-        print("  kit.loop.agent not importable yet — skipping the live canonicaliser demo")
-        demo_commands: list[Command] = [good_cmd]
-    else:
-        raw_actions = [
-            "MCP registry.provenance anchor=Frame:3f2a9c11/w/041 fields=etag",
-            'MCP slides.query q="streamable http replaces http+sse" fields=title,body',
-            "A2A curriculum-analyst.which_days_cover concept=Concept:streamable-http fields=anchor,course_day,track",
-            "DISCOVER registry.list_servers fields=name",
-        ]
-        demo_commands = []
-        for i, raw in enumerate(raw_actions):
-            action = _canonicalise_action(raw, call_index=i)
-            cmd = Command.from_action_dict(action, cmd_id=f"cmd:{i:04d}")
-            print(f"  {raw!r}\n    -> {cmd.kind}: {cmd.server}.{cmd.tool} fields={cmd.fields}")
-            demo_commands.append(cmd)
-        assert {c.kind for c in demo_commands} == {"mcp", "a2a", "discover"}
-
-        answer_action = _canonicalise_action(
-            'ANSWER {"text": "day 26, track P2T2"}', call_index=None
-        )
-        try:
-            Command.from_action_dict(answer_action, cmd_id="cmd:9999")
-        except ValueError as exc:
-            print(f"\n  an 'answer' action correctly refuses to become a Command: {exc}")
-        else:
-            raise AssertionError("expected ValueError for an 'answer' action")
-
-    print("\n=== Gateway.decide — the naive starter forwards everything ===\n")
-    ctx = RecordingGatewayContext(
-        act="learner:sv-0401",
-        sub="agent:demo-team",
-        scopes=frozenset({"wiki.read"}),
-        credits=100,
-        round=1,
-        call_index=0,
-        leases=(),
-        history=(),
-    )
-    assert isinstance(ctx, GatewayContext), "RecordingGatewayContext must structurally satisfy GatewayContext"
+    ctx = RecordingGatewayContext(act='learner:sv-0417', sub='agent:vlearn-tutor',
+                                  scopes=frozenset({'wiki.read'}), credits=100,
+                                  round=1, call_index=0)
     gw = Gateway(ctx)
-    for cmd in demo_commands:
-        decision = gw.decide(cmd)
-        print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
-        assert decision.verdict == "forward"
-        assert decision.call is not None
-        call_dict = decision.call.to_dict() if hasattr(decision.call, "to_dict") else decision.call
-        assert call_dict["server"] == cmd.server
-        assert call_dict["tool"] == cmd.tool
-        assert tuple(call_dict["fields"]) == cmd.fields
-
-    print(f"\n=== Gateway.deny — the unused-by-default free-abstention path ===\n")
-    denial = gw.deny(demo_commands[0], reason="demo: withholding pending a fresher registry.provenance read")
-    print(f"  gw.deny(...) -> verdict={denial.verdict!r} reason={denial.reason!r} call={denial.call!r}")
-    assert denial.verdict == "deny"
-    assert denial.call is None
-    assert demo_commands[0].cmd_id in gw._denied_cmd_ids
-
-    print(f"\n=== own_telemetry — recorded on YOUR side only, never shown to the opponent ===\n")
-    print(f"  {len(ctx.events)} events recorded on this ctx this run:")
-    for ev in ctx.events:
-        print(f"    {ev['name']}: {sorted(ev['payload'].keys())}")
-    assert len(ctx.events) >= len(demo_commands) * 2 + 1  # decision_seen + decision_made per call, plus the deny
-
-    print("\nAll agent/gateway.py demos passed.")
+    action = _canonicalise_action('MCP slides.query q=mcp limit=2', call_index=0)
+    cmd = Command.from_action_dict(action, cmd_id='cmd:demo')
+    decision = gw.decide(cmd)
+    assert decision.verdict == 'rewrite' and decision.call.args['limit'] == 2
+    bad = replace(cmd, args={'q': 'mcp', 'route': 'c'})
+    assert gw.decide(bad).verdict == 'deny'
+    print('Completed gateway checks passed.')

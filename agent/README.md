@@ -8,6 +8,11 @@ scope thiếu, write thiếu provenance/precondition và replay; giới hạn ma
 số dòng và ngân sách theo vòng. Card và provenance được cấp bởi host tin cậy
 qua note_card/note_provenance; bản signed A2A kiểm tra token bằng verifier của kit.
 
+Sau rà soát: ownership bao phủ Learner anchor; provenance lấy được từ trusted
+history; luôn cần signed delegation; roster dùng declared skill role_of.
+Limit từ parser được chuyển kiểu, rate limit chặn trước gọi tool; local tool
+của kit vẫn dùng được. Dependency được import khi tải module, trước decide.
+
 Guardrail đã cài injection scanner, redaction (nhận private_values từ nguồn),
 kiểm tra phép tính và số đối chiếu sources, cùng abstention có điều kiện.
 ANSWER không đi qua Gateway: prompt yêu cầu áp dụng các helper khi ráp câu trả lời.

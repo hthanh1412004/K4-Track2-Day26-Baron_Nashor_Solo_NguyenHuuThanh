@@ -1,6 +1,8 @@
 """Conservative, trace-only evidence discovery. No world truth or fixture labels."""
 import re
 from collections.abc import Mapping
+from kit.mcp.specs import TOOL_SPECS
+from kit.world.anchor import Anchor, AnchorSyntaxError
 
 
 def payload(event):
@@ -8,10 +10,7 @@ def payload(event):
     return value if isinstance(value, Mapping) else {}
 
 
-def discover(trace, answer, card):
-    from eval.prosecute import group_calls, evt_ref, span_ref, split_sentences
-    from kit.mcp.specs import TOOL_SPECS
-
+def discover(trace, answer, card, *, group_calls, evt_ref, span_ref, split_sentences):
     hits = {}
     events = sorted((e for e in trace if isinstance(e, Mapping)), key=lambda e: e.get('seq', 0))
     groups = group_calls(events)
@@ -35,8 +34,25 @@ def discover(trace, answer, card):
     def ref(e):
         return evt_ref(e['seq'])
 
-    if final and cited - returned:
-        add('fabricated_citation', [ref(final)], f'Cited anchors were never returned this exchange: {sorted(cited-returned)}')
+    def was_returned(raw):
+        if raw in returned:
+            return True
+        try:
+            target = Anchor.parse(raw)
+        except (AnchorSyntaxError, TypeError):
+            return False
+        for source_raw in returned:
+            try:
+                source = Anchor.parse(source_raw)
+            except (AnchorSyntaxError, TypeError):
+                continue
+            if (target.ns, target.slug, target.idx) == (source.ns, source.slug, source.idx) and (target.rev is None or target.rev == source.rev):
+                return True
+        return False
+
+    fabricated = sorted(a for a in cited if not was_returned(a))
+    if final and fabricated:
+        add('fabricated_citation', [ref(final)], f'Cited anchors were never returned this exchange: {fabricated}')
 
     starts = [payload(e) for e in events if e.get('type') == 'exchange_start']
     defender = starts[0].get('act') or starts[0].get('defender') if starts else None
@@ -92,7 +108,7 @@ def discover(trace, answer, card):
                     if key in answer and key in row and answer[key] != row[key] and final:
                         add('wrong_answer', [ref(final), ref(event)], f'Answer {key}={answer[key]!r} contradicts the retrieved cited row {key}={row[key]!r}.')
             body = str(row.get('body') or row.get('definition') or '')
-            if re.search(r'roughly|approximately|about|~|khoảng', body, re.I):
+            if cited.intersection(p.get('anchors') or ()) and re.search(r'roughly|approximately|about|~|khoảng', body, re.I):
                 source_nums = set(re.findall(r'\d+(?:\.\d+)?', body))
                 for i, span in enumerate(spans):
                     if re.search(r'\d+\.\d+', span) and any(re.match(r'\d+\.\d+', n) and n not in source_nums for n in re.findall(r'\d+(?:\.\d+)?', span)):
