@@ -1,5 +1,14 @@
 # TASK 2 · PROSECUTE — `eval/prosecute.py`
 
+## Công tố nhóm solo Baron_Nashor_Solo_NguyenHuuThanh
+
+prosecute đã nối detector vào ProsecutionBudget. eval/detectors.py tìm bằng
+chứng từ trace và answer; không đọc label fixture hay truth.json trong entry point.
+Trên 40 fixture: precision 1.000, recall 0.824, F1 0.903; 28 verified,
+0 false, 0 unproven, 0 rejected. Các lớp chưa có đủ bằng chứng trong heuristic
+hiện tại (stale_read, hallucination, ungrounded) được bỏ qua thay vì đoán.
+Các đoạn nói starter/stub bên dưới mô tả baseline của kit.
+
 > **Không chỉ ra được thì không có sát thương.** Một đòn tấn công của bạn dù trúng đến đâu, nếu
 > đối thủ không nêu được bằng chứng thì trọng tài không chấm điểm gì cả. Và ngược lại: khi BẠN là
 > bên cáo buộc, việc bạn phải làm không phải là "tìm ra lỗi" mà là **chứng minh nó, đúng sự kiện,

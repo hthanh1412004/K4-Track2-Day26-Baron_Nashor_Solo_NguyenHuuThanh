@@ -1,5 +1,20 @@
 # agent/ — bản đồ năm file · map of the five files
 
+## Bản hoàn thành của nhóm solo Baron_Nashor_Solo_NguyenHuuThanh
+
+Gateway đã thực thi ROUTE, ADMIT, AUTHORIZE, BUDGET: chặn body route,
+identity không được registry xác nhận, lease hết hạn, target khác ctx.act,
+scope thiếu, write thiếu provenance/precondition và replay; giới hạn mask,
+số dòng và ngân sách theo vòng. Card và provenance được cấp bởi host tin cậy
+qua note_card/note_provenance; bản signed A2A kiểm tra token bằng verifier của kit.
+
+Guardrail đã cài injection scanner, redaction (nhận private_values từ nguồn),
+kiểm tra phép tính và số đối chiếu sources, cùng abstention có điều kiện.
+ANSWER không đi qua Gateway: prompt yêu cầu áp dụng các helper khi ráp câu trả lời.
+Spar dùng câu trả lời dựng sẵn nên không kiểm chứng chất lượng câu trả lời model.
+
+Phần dưới giữ mô tả của kit ban đầu để tham khảo; các dòng ghi stub/starter là baseline.
+
 *Bạn sở hữu toàn bộ thư mục này (RULES.md mục 1). Đọc bảng dưới TRƯỚC khi
 sửa bất cứ file nào — nó nói mỗi file quyết định gì, bị chấm ở đâu trong
 trace, và cứu bạn khỏi lớp lỗi nào trong 17 lớp (CONTRACTS.md mục 6.1).*

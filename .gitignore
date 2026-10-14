@@ -7,3 +7,5 @@ runs/
 kit/world/*/
 !kit/world/*.py
 *.local.json
+GUIDE.md
+LAB_REPORT.md

@@ -1,5 +1,18 @@
 # deck/ — cách viết một lá bài · how to author a card
 
+## Deck solo Baron_Nashor_Solo_NguyenHuuThanh
+
+14 lá gồm 10 attack và 4 blank, đủ 4 MCP / 4 A2A / 2 gateway và 9 lớp.
+atk_04 nhắm mcp:slides với ASK về Concept:trace/w/089 để poisoned result
+nằm trên đường truy xuất slide. atk_07 kích hoạt ở call_index >= 3 để giữ
+các lời gọi đầu sạch rồi thử đổi learner ở bước delegation. Mọi defense_event
+được chuẩn hóa thành gateway.denied.
+
+Lineup dùng blk_01 tại vòng 4 thay atk_05 để thử false positive sau một đòn
+forged_card; atk_07 nằm cuối ở vòng có trọng số cao. atk_05 vẫn trong deck dự bị.
+Đã validate trên world chính thức: 0 FAIL, 1 WARN về giới hạn proxy lethality.
+Các bảng bên dưới mô tả deck gốc của kit, làm tài liệu tham khảo.
+
 *Bạn sở hữu thư mục này (RULES.md mục 1). `deck.json` là bộ bài xuất phát — 14 lá hợp lệ, đã
 kiểm chứng bằng dữ liệu thật của kho ngữ liệu. Sửa nó, đừng chỉ dùng nguyên bản; quyết định thú vị
 nhất khi viết một lá bài không nằm ở cú pháp, mà ở việc chọn ASK nào khiến lời nói dối khó bị bắt
